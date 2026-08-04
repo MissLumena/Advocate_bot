@@ -26,6 +26,11 @@ SYSTEM_PROMPT = """Ты — Senior Career Advocate и жесткий карье�
 
 chat_histories: Dict[int, List[Dict[str, str]]] = {}
 
+requests.post(
+    f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/sendChatAction",
+    json={"chat_id": chat_id, "action": "typing"},
+    timeout=5,
+)
 
 def build_reply(user_text: str, history: List[Dict[str, str]] | None = None) -> str:
     history = history or []
@@ -37,8 +42,8 @@ def build_reply(user_text: str, history: List[Dict[str, str]] | None = None) -> 
             response = client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                 messages=messages,
-                temperature=0.7,
-                max_tokens=500,
+                temperature=0.3,
+                max_tokens=300,
             )
             content = response.choices[0].message.content
             return content.strip() if content else "Коротко: нужен более точный запрос."

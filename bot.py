@@ -69,7 +69,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    reply = await generate_reply(history)
+    reply = await 
+    (history)
 
     history.append({"role": "assistant", "content": reply})
     context.user_data["history"] = history[-10:]
@@ -81,13 +82,13 @@ async def generate_reply(history: List[Dict[str, str]]) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
         try:
-            client = OpenAI(api_key=api_key)
+            client = client = AsyncOpenAI(api_key=api_key)
             messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(...)
                 model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                 messages=messages,
-                temperature=0.7,
-                max_tokens=500,
+                temperature=0.3,
+                max_tokens=300,
             )
             content = response.choices[0].message.content
             return content.strip() if content else "Коротко: нужен более точный запрос."
