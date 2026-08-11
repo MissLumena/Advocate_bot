@@ -1,1 +1,1 @@
-web: python api/telegram.py
+web: python bot.py
