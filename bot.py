@@ -1,11 +1,16 @@
+import asyncio
+import logging
 import os
 from typing import List, Dict
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI  # Используем асинхронный клиент
+from openai import AsyncOpenAI
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -41,7 +46,7 @@ SYSTEM_PROMPT = """Ты — Senior Career Advocate и жесткий карье�
 # Глобальный клиент OpenAI (создаётся один раз при старте)
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
-    print("⚠️ OPENAI_API_KEY не задан — бот будет работать только в offline-режиме (fallback).")
+    logger.warning("OPENAI_API_KEY не задан — бот будет работать только в offline-режиме (fallback).")
 client = AsyncOpenAI(api_key=api_key) if api_key else None
 
 
@@ -112,8 +117,7 @@ async def generate_reply(history: List[Dict[str, str]]) -> str:
         return reply
 
     except Exception as e:
-        # В случае ошибки (нет интернета, проблемы с API и т.д.) — падаем в fallback
-        print(f"⚠️ Ошибка OpenAI: {e}")
+        logger.warning("Ошибка OpenAI: %s", e)
         return _fallback_response(history)
 
 
@@ -157,11 +161,33 @@ def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Add it to your environment or .env file.")
 
+    try:
+        asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    logger.info("Запуск Telegram-бота...")
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    webhook_mode = os.getenv("WEBHOOK_MODE", "false").lower() == "true"
+    if webhook_mode:
+        webhook_url = os.getenv("WEBHOOK_URL")
+        if not webhook_url:
+            raise RuntimeError("WEBHOOK_URL is required when WEBHOOK_MODE=true")
+        port = int(os.getenv("PORT", "8443"))
+        logger.info("Запуск в режиме webhook на порту %s", port)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path="bot",
+            webhook_url=f"{webhook_url.rstrip('/')}/bot",
+        )
+    else:
+        logger.info("Запуск в режиме polling")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
