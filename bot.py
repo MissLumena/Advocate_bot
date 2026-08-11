@@ -89,7 +89,7 @@ async def generate_reply(history: List[Dict[str, str]]) -> str:
                 messages=messages,
                 temperature=0.3,
                 max_tokens=300,
-            )
+            
             content = response.choices[0].message.content
             return content.strip() if content else "Коротко: нужен более точный запрос."
         except Exception:
