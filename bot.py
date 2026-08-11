@@ -44,10 +44,10 @@ SYSTEM_PROMPT = """Ты — Senior Career Advocate и жесткий карье�
 """
 
 # Глобальный клиент OpenAI (создаётся один раз при старте)
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    logger.warning("OPENAI_API_KEY не задан — бот будет работать только в offline-режиме (fallback).")
-client = AsyncOpenAI(api_key=api_key) if api_key else None
+api_key = os.getenv("OPENAI_API_KEY", "").strip()
+if not api_key or api_key.startswith("your_"):
+    logger.warning("OPENAI_API_KEY не задан или не заменён на реальный ключ — бот будет работать в offline-режиме (fallback).")
+client = AsyncOpenAI(api_key=api_key) if api_key and not api_key.startswith("your_") else None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -121,44 +121,125 @@ async def generate_reply(history: List[Dict[str, str]]) -> str:
         return _fallback_response(history)
 
 
+def _extract_city(text: str) -> str | None:
+    cities = [
+        "москва", "спб", "санкт-петербург", "санкт петербург", "новосибирск", "екатеринбург",
+        "казань", "нижний новгород", "челябинск", "самара", "омск", "ростов", "уфа", "краснодар"
+    ]
+    lower = text.lower()
+    for city in cities:
+        if city in lower:
+            return city
+    return None
+
+
+def _extract_keywords(text: str) -> dict:
+    lower = text.lower()
+    return {
+        "vacancy": any(word in lower for word in [
+            "вакан", "ваканс", "должность", "требован", "job", "vacancy", "vacancies", "позиция", "позицию"
+        ]),
+        "salary": any(word in lower for word in [
+            "зарп", "salary", "зп", "budget", "денег", "оклад", "вилк", "compensation", "offer"
+        ]),
+        "resume": any(word in lower for word in [
+            "резюме", "cv", "опыт", "stack", "python", "java", "javascript", "go", "c#", "react", "ts", "node",
+            "backend", "frontend", "devops", "data", "qa"
+        ]),
+        "city": _extract_city(text),
+        "analysis": any(word in lower for word in [
+            "разбор", "разобрать", "разобрать вакансию", "анализ", "оценка рисков", "смотреть вакансию"
+        ]),
+        "schedule": any(word in lower for word in [
+            "график", "schedule", "режим", "график работы", "work schedule"
+        ]),
+        "advice": any(word in lower for word in [
+            "совет", "советы", "подсказ", "подскажи", "что делать", "как лучше", "как действовать", "help"
+        ]),
+    }
+
+
 def _fallback_response(history: List[Dict[str, str]]) -> str:
     """
     Упрощённый ответ, когда OpenAI недоступен.
-    Использует эвристики (ключевые слова), чтобы не молчать.
+    Использует эвристики и распознаёт основные типы запросов.
     """
     if not history:
         return "Скажите, что именно хотите разобрать: вакансию, резюме или переговоры."
 
     last_user = history[-1]["content"] if history[-1]["role"] == "user" else ""
-
     if not last_user:
         return "Я готов помочь. Напишите ваш запрос."
 
-    if "зарп" in last_user.lower() or "salary" in last_user.lower():
+    k = _extract_keywords(last_user)
+
+    if k["analysis"]:
+        if k["city"]:
+            return (
+                f"Понял. Вы хотите разбор вакансии для {k['city']}. "
+                "Я выделю скрытые требования, оценю риски, подскажу, на что обратить внимание, и дам готовый вариант ответа рекрутеру."
+            )
         return (
-            "Для точной вилки мне нужны город и стек. "
-            "Напишите, в каком городе и на какой роли вы торгуетесь — я дам рабочий диапазон."
+            "Понял. Вы хотите разбор вакансии. "
+            "Я выделю скрытые требования, оценю риски и подскажу, как лучше отвечать рекрутеру или вести переговоры."
         )
 
-    if "вакан" in last_user.lower() or "job" in last_user.lower():
+    if k["vacancy"]:
+        if k["city"]:
+            return (
+                f"Понял. Это запрос по вакансии для {k['city']}. "
+                "Я уже могу помочь: разберу риски, выделю скрытые боли, предложу сценарий переговоров и дам короткий ответ рекрутеру."
+            )
         return (
-            "Отправьте текст вакансии. Я разберу скрытые боли работодателя, выделю риски и дам готовый ответ рекрутеру."
+            "Понял. Это выглядит как запрос по вакансии. "
+            "Я могу помочь с разбором, оценкой рисков и подготовкой ответа рекрутеру."
         )
 
-    if "резюме" in last_user.lower() or "cv" in last_user.lower():
+    if k["salary"]:
+        if k["city"]:
+            return (
+                f"Понял. Вы спрашиваете про зарплату для {k['city']}. "
+                "Я помогу оценить вилку, но для точности пришлите стек, грейд и ваш опыт."
+            )
         return (
-            "Пришлите текущее резюме или краткий список опыта по стеку и ролям — я подготовлю ATS-оптимизированную версию."
+            "Понял. Вы спрашиваете про зарплату. "
+            "Я помогу оценить вилку. Для точности пришлите город, стек, грейд и ваш опыт."
+        )
+
+    if k["schedule"]:
+        return (
+            "Понял. Вы спрашиваете про график. "
+            "Я могу подсказать, как оценить режим работы, как это влияет на нагрузку и какие вопросы задать работодателю."
+        )
+
+    if k["advice"]:
+        return (
+            "Понял. Вы хотите совет. "
+            "Я могу подсказать, как лучше действовать в вакансии, на переговорах, в резюме или при выборе оффера."
+        )
+
+    if k["resume"]:
+        return (
+            "Понял. Это похоже на запрос по резюме или стеку. "
+            "Я могу помочь с ATS-оптимизацией, структурой опыта и подбором сильных формулировок."
+        )
+
+    if k["city"]:
+        return (
+            f"Понял. Вы указали город {k['city']}. "
+            "Я готов помочь дальше. Пришлите ещё стек, грейд или текст вакансии — и я дам полезный ответ."
         )
 
     return (
-        "Я работаю в формате: разбор вакансии, оценка рисков, сценарий переговоров по зарплате и 3 варианта ответа рекрутеру. "
-        "Пришлите вакансию, резюме или ваш запрос — и я дам готовый ответ."
+        "Понял. Я могу помочь с разбором вакансии, оценкой зарплаты, графиком, советами по переговорам и ATS-оптимизацией резюме. "
+        "Если хотите, просто пришлите вакансию, резюме, город, стек или свой вопрос — и я сразу отвечу."
     )
 
 
 def main() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token or token.startswith("your_"):
+        logger.error("TELEGRAM_BOT_TOKEN не задан или не заменён на реальный токен")
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Add it to your environment or .env file.")
 
     try:
