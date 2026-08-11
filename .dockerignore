@@ -4,5 +4,7 @@ __pycache__/
 *.pyd
 .git/
 .gitignore
-.env
 .venv/
+
+# .env intentionally kept for local Docker builds and local development.
+# For deployment, configure secrets via the platform environment variables instead.

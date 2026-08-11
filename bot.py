@@ -1,8 +1,12 @@
 import asyncio
+import base64
+import json
 import logging
 import os
+import tempfile
 from typing import List, Dict
 
+import requests
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telegram import Update
@@ -12,7 +16,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# Load local .env explicitly from project root, so local Docker builds and dev runs
+# can pick up secrets while deployment platforms still use real environment variables.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"), override=False)
+if os.path.exists(os.path.join(BASE_DIR, ".env")):
+    logger.info("Загружен .env из %s", os.path.join(BASE_DIR, ".env"))
 
 SYSTEM_PROMPT = """Ты — Senior Career Advocate и жесткий карьерный стратег из агентства JobMatch Pro.
 Твоя аудитория — IT-специалисты и менеджеры Middle+/Senior. Ты работаешь исключительно на кандидата, помогая ему выбить максимальный оффер и избежать токсичных мест.
@@ -44,30 +53,59 @@ SYSTEM_PROMPT = """Ты — Senior Career Advocate и жесткий карье�
 """
 
 # Инициализация LLM-клиента.
-# Поддерживаются оба варианта, чтобы не зависеть от конкретного провайдера:
-#   - OPENAI_API_KEY (как указано в README/.env.example) -> обычный OpenAI API
-#   - DEEPSEEK_API_KEY -> DeepSeek API (совместим с OpenAI SDK)
-# Если задано и то, и то — приоритет у OPENAI_API_KEY.
+# Приоритет: DeepSeek -> OpenAI -> GigaChat.
+# В проекте у пользователя используется DeepSeek, поэтому именно он должен быть основным провайдером.
 openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-
+gigachat_credentials = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+gigachat_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip()
+MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip() or os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+provider = "offline"
 client = None
-if openai_api_key and not openai_api_key.startswith("your_"):
-    client = AsyncOpenAI(api_key=openai_api_key, timeout=60.0)
-    logger.info("Клиент OpenAI успешно создан (модель: %s).", MODEL_NAME)
-elif deepseek_api_key and not deepseek_api_key.startswith("your_"):
-    client = AsyncOpenAI(
-        api_key=deepseek_api_key,
-        base_url="https://api.deepseek.com/v1",
-        timeout=60.0,
+
+
+def _get_gigachat_oauth_token() -> str:
+    """Получает OAuth-токен для GigaChat из client_id:client_secret."""
+    raw = base64.b64decode(gigachat_credentials).decode("utf-8")
+    if ":" not in raw:
+        raise ValueError("GIGACHAT_CREDENTIALS должен быть в формате base64(client_id:client_secret)")
+
+    client_id, client_secret = raw.split(":", 1)
+    auth = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("utf-8")
+
+    response = requests.post(
+        "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={"grant_type": "client_credentials"},
+        timeout=30,
     )
+    response.raise_for_status()
+    payload = response.json()
+    token = payload.get("access_token")
+    if not token:
+        raise ValueError("GigaChat OAuth ответ не содержит access_token")
+    return token
+
+
+if deepseek_api_key and not deepseek_api_key.startswith("your_"):
+    provider = "deepseek"
     MODEL_NAME = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
-    logger.info("Клиент DeepSeek успешно создан (модель: %s).", MODEL_NAME)
+    logger.info("DeepSeek активирован (модель: %s).", MODEL_NAME)
+elif openai_api_key and not openai_api_key.startswith("your_"):
+    client = AsyncOpenAI(api_key=openai_api_key, timeout=60.0)
+    provider = "openai"
+    logger.info("Клиент OpenAI успешно создан (модель: %s).", MODEL_NAME)
+elif gigachat_credentials and not gigachat_credentials.startswith("your_"):
+    provider = "gigachat"
+    MODEL_NAME = gigachat_model or "GigaChat"
+    logger.info("Клиент GigaChat будет использовать OAuth-поток (модель: %s).", MODEL_NAME)
 else:
     logger.warning(
-        "Ни OPENAI_API_KEY, ни DEEPSEEK_API_KEY не заданы (или не заменены с примера) — "
-        "бот будет работать в offline-режиме (fallback)."
+        "Ни DEEPSEEK_API_KEY, ни OPENAI_API_KEY, ни GIGACHAT_CREDENTIALS не заданы "
+        "(или не заменены с примера) — бот будет работать в offline-режиме (fallback)."
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -112,14 +150,75 @@ async def generate_reply(history: List[Dict[str, str]]) -> str:
     встроенный fallback-режим на эвристиках (_fallback_response),
     а не сырой текст ошибки.
     """
-    logger.info(f"generate_reply вызван. client = {client is not None}")
+    logger.info("generate_reply вызван. provider=%s client=%s", provider, client is not None)
 
-    if not client:
+    if provider == "offline":
         logger.error("LLM-клиент не инициализирован — используем fallback.")
         return _fallback_response(history)
 
     try:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+
+        if provider == "deepseek":
+            payload = {
+                "model": MODEL_NAME,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 500,
+            }
+            logger.info("Отправляем запрос в DeepSeek (%s)...", MODEL_NAME)
+            response = await asyncio.to_thread(
+                requests.post,
+                "https://api.deepseek.com/v1/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {deepseek_api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = data["choices"][0]["message"]["content"]
+            if not text:
+                logger.warning("DeepSeek вернул пустой ответ — используем fallback.")
+                return _fallback_response(history)
+            logger.info("Ответ от DeepSeek получен.")
+            return text.strip()
+
+        if provider == "gigachat":
+            token = await asyncio.to_thread(_get_gigachat_oauth_token)
+            payload = {
+                "model": MODEL_NAME,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 500,
+            }
+            logger.info("Отправляем запрос в GigaChat (%s)...", MODEL_NAME)
+            response = await asyncio.to_thread(
+                requests.post,
+                "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = data["choices"][0]["message"]["content"]
+            if not text:
+                logger.warning("GigaChat вернул пустой ответ — используем fallback.")
+                return _fallback_response(history)
+            logger.info("Ответ от GigaChat получен.")
+            return text.strip()
+
+        if not client:
+            logger.error("LLM-клиент не инициализирован — используем fallback.")
+            return _fallback_response(history)
 
         logger.info("Отправляем запрос в LLM (%s)...", MODEL_NAME)
         response = await client.chat.completions.create(
@@ -138,8 +237,6 @@ async def generate_reply(history: List[Dict[str, str]]) -> str:
         return reply
 
     except Exception as e:
-        # Полная ошибка уходит в лог для диагностики, а пользователю
-        # не показываем технический текст — отвечаем шаблоном-заглушкой.
         logger.error("Ошибка при обращении к LLM: %s: %s", type(e).__name__, e)
         return _fallback_response(history)
 
@@ -260,36 +357,54 @@ def _fallback_response(history: List[Dict[str, str]]) -> str:
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or token.startswith("your_"):
-        logger.error("TELEGRAM_BOT_TOKEN не задан или не заменён на реальный токен")
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Add it to your environment or .env file.")
+        logger.error(
+            "TELEGRAM_BOT_TOKEN не задан или не заменён на реальный токен. "
+            "Проверьте .env локально или задайте переменную окружения в Railway/Render/Docker."
+        )
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set. Add it to .env or set it in the deployment environment. "
+            "For local Docker: docker run --env-file .env ..."
+        )
+
+    lock_path = os.path.join(tempfile.gettempdir(), "advocate_bot.lock")
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+    except FileExistsError:
+        logger.warning("Бот уже запущен в другом процессе. Останавливаю дубль.")
+        return
 
     try:
-        asyncio.get_event_loop_policy().get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-    logger.info("Запуск Telegram-бота...")
-    application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("reset", reset))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        logger.info("Запуск Telegram-бота...")
+        application = Application.builder().token(token).build()
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("reset", reset))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    webhook_mode = os.getenv("WEBHOOK_MODE", "false").lower() == "true"
-    if webhook_mode:
-        webhook_url = os.getenv("WEBHOOK_URL")
-        if not webhook_url:
-            raise RuntimeError("WEBHOOK_URL is required when WEBHOOK_MODE=true")
-        port = int(os.getenv("PORT", "8443"))
-        logger.info("Запуск в режиме webhook на порту %s", port)
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="bot",
-            webhook_url=f"{webhook_url.rstrip('/')}/bot",
-        )
-    else:
-        logger.info("Запуск в режиме polling")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        webhook_mode = os.getenv("WEBHOOK_MODE", "false").lower() == "true"
+        if webhook_mode:
+            webhook_url = os.getenv("WEBHOOK_URL")
+            if not webhook_url:
+                raise RuntimeError("WEBHOOK_URL is required when WEBHOOK_MODE=true")
+            port = int(os.getenv("PORT", "8443"))
+            logger.info("Запуск в режиме webhook на порту %s", port)
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path="bot",
+                webhook_url=f"{webhook_url.rstrip('/')}/bot",
+            )
+        else:
+            logger.info("Запуск в режиме polling")
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        try:
+            os.close(lock_fd)
+            os.unlink(lock_path)
+        except OSError:
+            pass
 
 if __name__ == "__main__":
     main()
