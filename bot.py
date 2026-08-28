@@ -159,24 +159,56 @@ async def generate_reply(history: List[Dict[str, str]]) -> str:
         return _fallback_response(history)
 
     try:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        query = build_query(history)
         if is_configured():
             try:
-                chunks = await search_async(build_query(history))
+                chunks = await search_async(query)
                 context = format_context(chunks)
+                logger.info(
+                    "RAG query=%r chunks=%s sources=%s",
+                    query,
+                    len(chunks),
+                    [chunk.get("source_file") or chunk.get("metadata", {}).get("source_file", "unknown") for chunk in chunks],
+                )
                 if context:
                     messages.append({
-                        "role": "user",
+                        "role": "system",
                         "content": (
-                            "Контекст из базы знаний (используй только если релевантно; "
-                            "если данных не хватает — прямо скажи об этом):\n"
-                            f"{context}\n\n"
-                            f"История диалога и вопрос пользователя:\n{build_query(history)}"
+                            "Контекст из базы знаний. Используй его только если он релевантен вопросу. "
+                            "Не используй внешние знания для конкретных фактов, которых нет в контексте. "
+                            "Если ответа в контексте нет, честно скажи, что в базе знаний недостаточно данных, "
+                            "и задай уточняющие вопросы или предложи способ проверить информацию.\n---\n"
+                            f"{context}\n---"
                         ),
                     })
-                    logger.info("RAG: добавлено чанков: %s", len(chunks))
+                else:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "Релевантных фрагментов в базе знаний не найдено. "
+                            "Не выдумывай факты и цифры: честно сообщи, что данных в базе недостаточно."
+                        ),
+                    })
             except Exception as error:
-                logger.warning("RAG недоступен, продолжаем без контекста: %s: %s", type(error).__name__, error)
+                logger.warning("RAG query=%r chunks=0 error=%s: %s", query, type(error).__name__, error)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Поиск по базе знаний завершился ошибкой. Не выдумывай факты и цифры; "
+                        "честно сообщи пользователю, что подтверждённых данных в базе нет."
+                    ),
+                })
+        else:
+            logger.info("RAG query=%r chunks=0 status=not_configured", query)
+            messages.append({
+                "role": "system",
+                "content": (
+                    "База знаний не настроена или недоступна. Не выдумывай факты и цифры; "
+                    "честно сообщи пользователю, что подтверждённых данных в базе нет."
+                ),
+            })
+        messages.extend(history)
 
         if provider == "deepseek":
             payload = {

@@ -1,6 +1,9 @@
 python-telegram-bot==21.9
 python-dotenv==1.0.1
-openai==1.54.4
+openai==1.58.1
 Flask==3.0.3
 requests==2.32.3
-PyYAML==6.0.2
+PyYAML==6.0.3
+langchain-openai==0.2.14
+langchain-text-splitters==0.3.5
+supabase==2.11.0
