@@ -13,6 +13,8 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from rag import build_query, format_context, is_configured, search_async
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -158,6 +160,23 @@ async def generate_reply(history: List[Dict[str, str]]) -> str:
 
     try:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+        if is_configured():
+            try:
+                chunks = await search_async(build_query(history))
+                context = format_context(chunks)
+                if context:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Контекст из базы знаний (используй только если релевантно; "
+                            "если данных не хватает — прямо скажи об этом):\n"
+                            f"{context}\n\n"
+                            f"История диалога и вопрос пользователя:\n{build_query(history)}"
+                        ),
+                    })
+                    logger.info("RAG: добавлено чанков: %s", len(chunks))
+            except Exception as error:
+                logger.warning("RAG недоступен, продолжаем без контекста: %s: %s", type(error).__name__, error)
 
         if provider == "deepseek":
             payload = {

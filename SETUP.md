@@ -37,3 +37,15 @@ curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=ht
 ```
 
 For local testing you can leave polling mode enabled.
+
+## 6. Enable RAG (optional)
+
+1. Create the `document_chunks` table and `match_document_chunks` function by running [supabase_schema.sql](supabase_schema.sql) in Supabase SQL Editor.
+2. Add `OPENAI_API_KEY`, `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` to `.env`. The OpenAI key is used only for `text-embedding-3-small` embeddings; chat can continue using DeepSeek.
+3. Put Markdown documents with YAML frontmatter under `knowledge/` and run:
+
+```bash
+python reindex.py
+```
+
+Reindexing is safe to repeat. It replaces all chunks for changed files and removes chunks for deleted files. Without complete RAG variables, the bot keeps its existing non-RAG behavior.
