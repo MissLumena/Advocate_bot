@@ -1,18 +1,22 @@
 """Manually index Markdown knowledge documents in Supabase pgvector."""
 
 import hashlib
+import base64
+import json
 import logging
 import os
 import re
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 import yaml
 from dotenv import load_dotenv
-from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from openai import RateLimitError
 from supabase import Client, create_client
+
+from rag import _embed
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -22,9 +26,27 @@ BASE_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
 EMBED_BATCH_SIZE = 100
 
+# --- Вспомогательная функция для преобразования значений в JSON-сериализуемые ---
+def _make_json_serializable(value: Any) -> Any:
+    """Рекурсивно преобразует объект в JSON-сериализуемый тип."""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _make_json_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_make_json_serializable(item) for item in value]
+    # Если ничего не подошло, преобразуем в строку
+    return str(value)
+
 
 def require_environment() -> None:
-    required = ("OPENAI_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY")
+    required = ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY")
     missing = [
         name for name in required
         if not os.getenv(name, "").strip() or os.getenv(name, "").strip().startswith("your_")
@@ -37,6 +59,18 @@ def require_environment() -> None:
             "SUPABASE_SERVICE_ROLE_KEY содержит публичный ключ. "
             "Укажите серверный service_role JWT или secret sb_secret_ ключ из Supabase Dashboard."
         )
+    if supabase_key.startswith("eyJ"):
+        try:
+            payload = supabase_key.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            role = json.loads(base64.urlsafe_b64decode(payload)).get("role")
+        except (IndexError, ValueError, json.JSONDecodeError) as error:
+            raise SystemExit("SUPABASE_SERVICE_ROLE_KEY содержит некорректный JWT.") from error
+        if role != "service_role":
+            raise SystemExit(
+                f"В SUPABASE_SERVICE_ROLE_KEY указана роль {role!r}, а не 'service_role'. "
+                "Скопируйте service_role key в Supabase Dashboard -> Project Settings -> API."
+            )
 
 
 def load_chunks() -> List[Dict[str, Any]]:
@@ -64,6 +98,10 @@ def load_chunks() -> List[Dict[str, Any]]:
 
         source_file = str(path.relative_to(BASE_DIR)).replace("\\", "/")
         metadata["source_file"] = source_file
+
+        # Преобразуем метаданные в JSON-сериализуемый вид сразу
+        metadata = _make_json_serializable(metadata)
+
         sections = header_splitter.split_text(body)
         documents = text_splitter.split_documents(sections)
         for chunk_index, document in enumerate(documents):
@@ -71,6 +109,8 @@ def load_chunks() -> List[Dict[str, Any]]:
             if not content:
                 continue
             chunk_metadata = {**metadata, **document.metadata, "chunk_index": chunk_index}
+            # Ещё раз преобразуем на всякий случай
+            chunk_metadata = _make_json_serializable(chunk_metadata)
             chunks.append({
                 "source_file": source_file,
                 "content": content,
@@ -92,7 +132,6 @@ def reindex() -> int:
     except Exception as error:
         raise SystemExit(f"Не удалось подключиться к Supabase: {error}") from error
 
-    embeddings = OpenAIEmbeddings(model=os.getenv("RAG_EMBEDDING_MODEL", "text-embedding-3-small"))
     chunks = load_chunks()
     existing = get_existing(supabase)
 
@@ -115,20 +154,23 @@ def reindex() -> int:
         if chunk["source_file"] not in existing_files or chunk["source_file"] in changed_files
     ]
     rows: List[Dict[str, Any]] = []
+
     for start in range(0, len(pending), EMBED_BATCH_SIZE):
         batch = pending[start:start + EMBED_BATCH_SIZE]
-        try:
-            vectors = embeddings.embed_documents([chunk["content"] for chunk in batch])
-        except RateLimitError as error:
-            if "insufficient_quota" in str(error) or "credit_balance_exhausted" in str(error):
-                raise SystemExit(
-                    "У OpenAI закончилась квота. Пополните баланс или замените OPENAI_API_KEY "
-                    "на ключ с доступным балансом."
-                ) from error
-            raise
-        rows.extend({**chunk, "embedding": vector} for chunk, vector in zip(batch, vectors))
+        for chunk in batch:
+            vector = _embed(chunk["content"])
+            # Приводим все значения вектора к float и проверяем NaN
+            vector = [float(x) for x in vector]
+            if any(x != x for x in vector):  # NaN != NaN
+                vector = [0.0 if x != x else x for x in vector]
 
-    # Удаляем изменённые файлы из базы
+            # Копируем чанк и добавляем вектор, также преобразуем metadata
+            row = {**chunk, "embedding": vector}
+            # Убеждаемся, что metadata сериализуемо
+            row["metadata"] = _make_json_serializable(row.get("metadata", {}))
+            rows.append(row)
+
+    # Удаляем изменённые файлы
     for source_file in sorted(changed_files):
         supabase.table("document_chunks").delete().eq("source_file", source_file).execute()
 
